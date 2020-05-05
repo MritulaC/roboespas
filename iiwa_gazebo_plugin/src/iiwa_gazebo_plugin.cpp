@@ -4,12 +4,14 @@
 #include <gazebo/common/common.hh>
 #include <stdio.h>
 #include <iostream>
+#include <cmath> 
 
 #include "ros/ros.h"
 #include "sensor_msgs/JointState.h"
 #include "trajectory_msgs/JointTrajectoryPoint.h"
 
-#define HOLD_FRAMES 100
+
+#define HOLD_FRAMES 10
 
 //Based on Matlab tutorial https://es.mathworks.com/help/robotics/examples/control-lbr-manipulator-motion-through-joint-torque.html
 
@@ -18,23 +20,68 @@ namespace gazebo
     class ModelPush : public ModelPlugin
     {
         private: 
-        ros::NodeHandle * n;
+        ros::NodeHandle * nh;
         ros::Publisher joint_state_pub;
         ros::Subscriber joint_torque_sub;
         bool applyPastCommand;
+        bool applyPastRead;
         int pastCommandCounter;
-        std::vector<float> pastCommand;
+        int pastReadCounter;
+        std::vector<float> pastCommandJointTorque;
+        std::vector<float> pastCommandJointPosition= {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
         int nFrame=1;
+        std::string control_type = "joint_position"; //It is read from parameters server initially and it can be "joint_position" or "joint_torque"
+        float max_joint_position_inc = 0.003;
 
         public: void JointStateCallback(const trajectory_msgs::JointTrajectoryPoint::ConstPtr& msg)
         {
             this->applyPastCommand = true;
             this->pastCommandCounter = 0;
-            this->pastCommand.clear();
-
-            this->pastCommand.push_back(0);
+            this->pastCommandJointTorque.clear();
+            this->pastCommandJointPosition.clear();
+            //Add first empty torque bc there are 8 joints and first one is not the first of the robot, is the joint between the ground and the robot
+            this->pastCommandJointTorque.push_back(0); 
+            this->pastCommandJointPosition.push_back(0);
             for (int i = 0; i < msg->effort.size(); i++) 
-                this->pastCommand.push_back(msg->effort[i]);
+            {
+                this->pastCommandJointTorque.push_back(msg->effort[i]);
+            }
+            //Check the commanded position is in the range of feasible joint positions
+            bool in_range = true;
+            ROS_INFO("diff: ");
+            for (int i=0; i < msg->positions.size(); i++)
+            {
+                float diff=std::abs(msg->positions[i]-pastCommandJointPosition[i+1]);
+                ROS_INFO("%f", diff);
+                if (diff > max_joint_position_inc)//
+                {
+                    in_range=false;
+                }
+            }
+            ROS_INFO("in range: %d", in_range);
+            if (in_range)
+            {
+                for (int i=0; i < msg->positions.size(); i++)
+                {
+                    this->pastCommandJointPosition.push_back(msg->positions[i]);
+                }
+            }
+            else
+            {
+                ROS_ERROR("Joint position commanded not in range.");
+            }
+            /*
+            ROS_INFO("joint_torque");
+            for (int i=0; i<pastCommandJointTorque.size(); i++)
+            {
+                ROS_INFO("%f", pastCommandJointTorque[i]);
+            }
+            ROS_INFO("joint_position command");
+            for (int i=0; i<pastCommandJointPosition.size(); i++)
+            {
+                ROS_INFO("%f", pastCommandJointPosition[i]);
+            }
+            ROS_INFO("--");*/
         }
 
         public: 
@@ -47,12 +94,13 @@ namespace gazebo
             // simulation iteration.
             this->updateConnection = event::Events::ConnectWorldUpdateBegin(
             boost::bind(&ModelPush::OnUpdate, this, _1));
-            this->n = new ros::NodeHandle("iiwa_gazebo");
-            this->joint_state_pub = n->advertise<sensor_msgs::JointState>("joint_state", 1);
-            this->joint_torque_sub = n->subscribe("joint_command", 1, &ModelPush::JointStateCallback, this);
+            this->nh = new ros::NodeHandle("iiwa_gazebo");
+            this->joint_state_pub = nh->advertise<sensor_msgs::JointState>("joint_state", 1);
+            this->joint_torque_sub = nh->subscribe("joint_command", 1, &ModelPush::JointStateCallback, this);
             this->pastCommandCounter = 0;
             this->applyPastCommand = false;
-
+            nh->getParam("/iiwa_gazebo_plugin/control_type", control_type);
+            nh->getParam("/iiwa_gazebo_plugin/max_joint_position_inc", max_joint_position_inc); 
             ROS_INFO("Finished loading IIWA Gazebo Command Plugin.");
         }
 
@@ -60,25 +108,54 @@ namespace gazebo
         public: 
         void OnUpdate(const common::UpdateInfo & _info)/*_info*/
         {
-            //Apply joint_torque received
-            sensor_msgs::JointState js_msg;
             physics::Joint_V joints = this->model->GetJoints();
-            if (this->applyPastCommand)
+            //COMMAND ROBOT DEPENDING ON THE TYPE OF CONTROL
+            if (strcmp(control_type.c_str(), "joint_torque")==0)
             {
-                for (int i = 0; i < joints.size() && i < this->pastCommand.size(); i++)
+
+                //Apply joint_torque received
+                if (this->applyPastCommand)
                 {
-                    // Force is additive (multiple calls to SetForce to the same joint in the same time step 
-                    // will accumulate forces on that Joint)?
-                    joints[i]->SetForce(0, this->pastCommand[i]);
+                    for (int i = 0; i < joints.size() && i < this->pastCommandJointTorque.size(); i++)
+                    {
+                        // Force is additive (multiple calls to SetForce to the same joint in the same time step 
+                        // will accumulate forces on that Joint)?
+                        joints[i]->SetForce(0, this->pastCommandJointTorque[i]);
+                    }
+                    this->pastCommandCounter += 1;
+                    if (this->pastCommandCounter >= HOLD_FRAMES) 
+                    { 
+                        this->applyPastCommand = false;
+                    }
+                } 
+            }
+            else
+            {
+                //Apply joint_position received
+                if (this->applyPastCommand)
+                {
+                    for (int i = 0; i < joints.size() && i < this->pastCommandJointPosition.size(); i++)
+                    {
+                        // Force is additive (multiple calls to SetForce to the same joint in the same time step 
+                        // will accumulate forces on that Joint)?
+                        joints[i]->SetPosition(0, this->pastCommandJointPosition[i]);
+                    }
+                    this->pastCommandCounter += 1;
+                    if (this->pastCommandCounter >= HOLD_FRAMES) 
+                    { 
+                        this->applyPastCommand = false;
+                    }
                 }
-                this->pastCommandCounter += 1;
-                if (this->pastCommandCounter >= HOLD_FRAMES) 
-                { 
-                    this->applyPastCommand = false;
+                else
+                {
+                    this->applyPastCommand = true;
+                    this->pastCommandCounter = 0;
                 }
+                
             }
 
-            //Fill joint state
+            //PUBLISH JOINT STATE
+            sensor_msgs::JointState js_msg;
             std::vector<physics::JointWrench> wrenches;
             for (int i = 1; i < joints.size(); i++)
             {
@@ -87,12 +164,12 @@ namespace gazebo
                 wrenches.push_back(joints[i]->GetForceTorque(1));
             }
             //Torques in each joint, check the rotation direction for each joint at home position
-            js_msg.effort.push_back(-wrenches[0].body2Torque.z);
-            js_msg.effort.push_back(-wrenches[1].body2Torque.y);
+		    js_msg.effort.push_back(-wrenches[0].body2Torque.z);
+            js_msg.effort.push_back(wrenches[1].body1Torque.y);
             js_msg.effort.push_back(-wrenches[2].body2Torque.z);
-            js_msg.effort.push_back(wrenches[3].body2Torque.y);
-            js_msg.effort.push_back(-wrenches[4].body2Torque.z);
-            js_msg.effort.push_back(-wrenches[5].body2Torque.y);
+            js_msg.effort.push_back(-wrenches[3].body1Torque.y);
+		    js_msg.effort.push_back(-wrenches[4].body2Torque.z);
+            js_msg.effort.push_back(wrenches[5].body1Torque.y);
             js_msg.effort.push_back(-wrenches[6].body2Torque.z);
             js_msg.name={"joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7"};
             js_msg.header.stamp=ros::Time::now();
